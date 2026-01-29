@@ -27,8 +27,6 @@ jobs:
     permissions:
       contents: read
       packages: write
-      # Necesario para cambiar la visibilidad del package a público
-      administration: write
 
     steps:
       - name: Checkout repository
@@ -106,44 +104,6 @@ jobs:
             echo "Digest: ${{ steps.build.outputs.digest }}"
           else
             echo "⚠️ No se detectó digest - verifica los logs del build"
-          fi
-
-      - name: Make package public
-        if: github.event_name != 'pull_request'
-        run: |
-          echo "🔓 Haciendo el package público..."
-          PACKAGE_NAME=$(echo "${{ env.IMAGE_NAME }}" | cut -d'/' -f2)
-          ORG_NAME=$(echo "${{ env.IMAGE_NAME }}" | cut -d'/' -f1)
-          
-          echo "Package: $PACKAGE_NAME"
-          echo "Organization: $ORG_NAME"
-          
-          # Esperar un momento para que el package esté disponible
-          sleep 5
-          
-          # Cambiar visibilidad a público usando la API de GitHub
-          RESPONSE=$(curl -s -w "\n%{http_code}" \
-            -X PATCH \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/orgs/$ORG_NAME/packages/container/$PACKAGE_NAME" \
-            -d '{"visibility":"public"}')
-          
-          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-          BODY=$(echo "$RESPONSE" | sed '$d')
-          
-          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "204" ]; then
-            echo "✅ Package configurado como público exitosamente"
-            echo "URL: https://github.com/orgs/$ORG_NAME/packages/container/$PACKAGE_NAME"
-          else
-            echo "⚠️ HTTP Code: $HTTP_CODE"
-            echo "Response: $BODY"
-            echo "⚠️ No se pudo cambiar la visibilidad automáticamente"
-            echo "Por favor, hazlo manualmente en:"
-            echo "https://github.com/orgs/$ORG_NAME/packages/container/$PACKAGE_NAME/settings"
-            echo ""
-            echo "O verifica que el token tenga permisos 'write:packages' y 'admin:org'"
           fi
 
       - name: Summary
