@@ -1,0 +1,276 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: argocd-extension-pod-forward
+  namespace: argocd
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: argocd-extension-pod-forward
+  namespace: argocd
+rules:
+- apiGroups:
+  - ''
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - ''
+  resources:
+  - pods/portforward
+  verbs:
+  - create
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: argocd-extension-pod-forward
+  namespace: argocd
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: argocd-extension-pod-forward
+subjects:
+- kind: ServiceAccount
+  name: argocd-extension-pod-forward
+  namespace: argocd
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: argocd-extension-pod-forward
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: argocd-extension-pod-forward
+    app.kubernetes.io/component: extension-backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: argocd-extension-pod-forward
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: argocd-extension-pod-forward
+    spec:
+      serviceAccountName: argocd-extension-pod-forward
+      containers:
+      - name: proxy
+        image: python:3.11-slim
+        imagePullPolicy: IfNotPresent
+        command:
+        - sh
+        - -c
+        args:
+        - 'apt-get update && apt-get install -y curl && \
+
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          && \
+
+          chmod +x kubectl && mv kubectl /usr/local/bin/ && \
+
+          apt-get clean && rm -rf /var/lib/apt/lists/* && \
+
+          pip install --no-cache-dir -r /app/requirements.txt && \
+
+          python /app/app.py
+
+          '
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+        env:
+        - name: PORT
+          value: '8080'
+        - name: ARGOCD_SERVER_URL
+          value: https://10.1.1.30:9090
+        - name: FORWARD_TIMEOUT
+          value: '3600'
+        - name: KUBECTL_NAMESPACE
+          value: argocd
+        volumeMounts:
+        - name: app-code
+          mountPath: /app
+          readOnly: true
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        resources:
+          requests:
+            memory: 128Mi
+            cpu: 100m
+          limits:
+            memory: 256Mi
+            cpu: 200m
+      volumes:
+      - name: app-code
+        configMap:
+          name: argocd-extension-pod-forward-config
+          defaultMode: 493
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-extension-pod-forward-config
+  namespace: argocd
+data:
+  app.py: "#!/usr/bin/env python3\n\"\"\"\nBackend proxy para Port Forward de ArgoCD\
+    \ Extension\nPermite hacer port-forward a pods desde la UI de ArgoCD\n\"\"\"\n\
+    \nimport os\nimport subprocess\nimport threading\nimport time\nimport logging\n\
+    from flask import Flask, request, jsonify, render_template_string\nfrom flask_cors\
+    \ import CORS\nimport uuid\n\napp = Flask(__name__)\nCORS(app)  # Permitir CORS\
+    \ para que ArgoCD pueda hacer peticiones\n\n# Configurar logging\nlogging.basicConfig(\n\
+    \    level=logging.INFO,\n    format='%(asctime)s - %(name)s - %(levelname)s -\
+    \ %(message)s'\n)\nlogger = logging.getLogger(__name__)\n\n# Almacenar procesos\
+    \ de port-forward activos\nactive_forwards = {}\nforward_lock = threading.Lock()\n\
+    \n# Configuración\nARGOCD_SERVER_URL = os.environ.get('ARGOCD_SERVER_URL', 'https://argocd.devops.cetraro.io')\n\
+    FORWARD_TIMEOUT = int(os.environ.get('FORWARD_TIMEOUT', '3600'))  # 1 hora por\
+    \ defecto\nKUBECTL_NAMESPACE = os.environ.get('KUBECTL_NAMESPACE', 'argocd')\n\
+    \nlogger.info(f\"Backend iniciado. ArgoCD URL: {ARGOCD_SERVER_URL}, Timeout: {FORWARD_TIMEOUT}s\"\
+    )\n\n\ndef start_port_forward(namespace: str, pod_name: str, pod_port: int, local_port:\
+    \ int) -> subprocess.Popen:\n    \"\"\"Inicia un port-forward usando kubectl\"\
+    \"\"\n    try:\n        cmd = [\n            'kubectl', 'port-forward',\n    \
+    \        f'pod/{pod_name}',\n            f'{local_port}:{pod_port}',\n       \
+    \     '-n', namespace,\n            '--address', '0.0.0.0'  # Escuchar en todas\
+    \ las interfaces\n        ]\n        \n        logger.info(f\"Iniciando port-forward:\
+    \ {' '.join(cmd)}\")\n        process = subprocess.Popen(\n            cmd,\n\
+    \            stdout=subprocess.PIPE,\n            stderr=subprocess.PIPE,\n  \
+    \          text=True\n        )\n        \n        # Esperar un momento para verificar\
+    \ que el proceso inició correctamente\n        time.sleep(1)\n        if process.poll()\
+    \ is not None:\n            # El proceso terminó inmediatamente, hubo un error\n\
+    \            stderr = process.stderr.read() if process.stderr else \"Unknown error\"\
+    \n            logger.error(f\"Error al iniciar port-forward: {stderr}\")\n   \
+    \         return None\n        \n        logger.info(f\"Port-forward iniciado\
+    \ exitosamente: {pod_name}:{pod_port} -> localhost:{local_port}\")\n        return\
+    \ process\n        \n    except Exception as e:\n        logger.error(f\"Error\
+    \ al iniciar port-forward: {str(e)}\", exc_info=True)\n        return None\n\n\
+    \ndef stop_port_forward(session_id: str):\n    \"\"\"Detiene un port-forward\"\
+    \"\"\n    with forward_lock:\n        if session_id in active_forwards:\n    \
+    \        process = active_forwards[session_id]['process']\n            if process\
+    \ and process.poll() is None:\n                process.terminate()\n         \
+    \       try:\n                    process.wait(timeout=5)\n                except\
+    \ subprocess.TimeoutExpired:\n                    process.kill()\n           \
+    \ del active_forwards[session_id]\n            logger.info(f\"Port-forward {session_id}\
+    \ detenido\")\n\n\n# Template HTML para mostrar el port-forward\nHTML_TEMPLATE\
+    \ = \"\"\"\n<!DOCTYPE html>\n<html>\n<head>\n    <title>Port Forward - {{ pod_name\
+    \ }}</title>\n    <meta charset=\"utf-8\">\n    <style>\n        body {\n    \
+    \        font-family: Arial, sans-serif;\n            max-width: 800px;\n    \
+    \        margin: 50px auto;\n            padding: 20px;\n            background-color:\
+    \ #f5f5f5;\n        }\n        .container {\n            background: white;\n\
+    \            padding: 30px;\n            border-radius: 8px;\n            box-shadow:\
+    \ 0 2px 4px rgba(0,0,0,0.1);\n        }\n        h1 {\n            color: #0DADEA;\n\
+    \            margin-top: 0;\n        }\n        .info {\n            background:\
+    \ #e8f4f8;\n            padding: 15px;\n            border-radius: 4px;\n    \
+    \        margin: 20px 0;\n        }\n        .info p {\n            margin: 5px\
+    \ 0;\n        }\n        .status {\n            padding: 10px;\n            border-radius:\
+    \ 4px;\n            margin: 20px 0;\n        }\n        .status.success {\n  \
+    \          background: #d4edda;\n            color: #155724;\n            border:\
+    \ 1px solid #c3e6cb;\n        }\n        .status.error {\n            background:\
+    \ #f8d7da;\n            color: #721c24;\n            border: 1px solid #f5c6cb;\n\
+    \        }\n        .link {\n            display: inline-block;\n            margin-top:\
+    \ 20px;\n            padding: 12px 24px;\n            background: #0DADEA;\n \
+    \           color: white;\n            text-decoration: none;\n            border-radius:\
+    \ 4px;\n            font-weight: bold;\n        }\n        .link:hover {\n   \
+    \         background: #0b9dd1;\n        }\n    </style>\n</head>\n<body>\n   \
+    \ <div class=\"container\">\n        <h1>\U0001F517 Port Forward</h1>\n      \
+    \  <div class=\"info\">\n            <p><strong>Pod:</strong> {{ pod_name }}</p>\n\
+    \            <p><strong>Namespace:</strong> {{ namespace }}</p>\n            <p><strong>Port:</strong>\
+    \ {{ port }}</p>\n            <p><strong>Local Port:</strong> {{ local_port }}</p>\n\
+    \        </div>\n        {% if status == 'error' %}\n        <div class=\"status\
+    \ error\">\n            <strong>Error:</strong> {{ error }}\n        </div>\n\
+    \        {% else %}\n        <div class=\"status success\">\n            <strong>✅\
+    \ Port-forward activo</strong>\n            <p>Puedes acceder al pod en: <code>http://localhost:{{\
+    \ local_port }}</code></p>\n        </div>\n        <a href=\"http://localhost:{{\
+    \ local_port }}\" target=\"_blank\" class=\"link\">\n            Abrir en nueva\
+    \ pestaña\n        </a>\n        {% endif %}\n    </div>\n</body>\n</html>\n\"\
+    \"\"\n\n\n@app.route('/health', methods=['GET'])\ndef health():\n    \"\"\"Health\
+    \ check endpoint\"\"\"\n    return jsonify({\"status\": \"healthy\"}), 200\n\n\
+    \n@app.route('/api/v1/extensions/pod-forward/forward', methods=['GET'])\ndef forward():\n\
+    \    \"\"\"Endpoint principal para iniciar port-forward\"\"\"\n    try:\n    \
+    \    # Validar autenticación (opcional, ArgoCD maneja esto)\n        auth_header\
+    \ = request.headers.get('Authorization', '')\n        if not auth_header and not\
+    \ request.args.get('token'):\n            # Permitir sin autenticación para pruebas,\
+    \ pero en producción deberías validar\n            logger.warning(\"Petición sin\
+    \ autenticación\")\n        \n        # Obtener parámetros\n        namespace\
+    \ = request.args.get('namespace')\n        pod_name = request.args.get('pod')\n\
+    \        port = int(request.args.get('port', 8080))\n        \n        if not\
+    \ namespace or not pod_name:\n            return jsonify({\"error\": \"Faltan\
+    \ parámetros: namespace y pod son requeridos\"}), 400\n        \n        # Generar\
+    \ session ID y local port\n        session_id = str(uuid.uuid4())\n        local_port\
+    \ = 9000 + (hash(session_id) % 1000)  # Puerto entre 9000-9999\n        \n   \
+    \     # Iniciar port-forward\n        process = start_port_forward(namespace,\
+    \ pod_name, port, local_port)\n        \n        if not process:\n           \
+    \ return render_template_string(\n                HTML_TEMPLATE,\n           \
+    \     pod_name=pod_name,\n                namespace=namespace,\n             \
+    \   port=port,\n                local_port=local_port,\n                status='error',\n\
+    \                error='No se pudo iniciar el port-forward',\n               \
+    \ session_id=session_id\n            ), 500\n        \n        # Guardar en active_forwards\n\
+    \        with forward_lock:\n            active_forwards[session_id] = {\n   \
+    \             'process': process,\n                'namespace': namespace,\n \
+    \               'pod': pod_name,\n                'pod_port': port,\n        \
+    \        'local_port': local_port,\n                'started_at': time.time()\n\
+    \            }\n        \n        # Programar timeout\n        def timeout_handler():\n\
+    \            time.sleep(FORWARD_TIMEOUT)\n            stop_port_forward(session_id)\n\
+    \            logger.info(f\"Port-forward {session_id} expirado después de {FORWARD_TIMEOUT}s\"\
+    )\n        \n        timeout_thread = threading.Thread(target=timeout_handler,\
+    \ daemon=True)\n        timeout_thread.start()\n        \n        # Retornar página\
+    \ HTML con información\n        return render_template_string(\n            HTML_TEMPLATE,\n\
+    \            pod_name=pod_name,\n            namespace=namespace,\n          \
+    \  port=port,\n            local_port=local_port,\n            status='success',\n\
+    \            session_id=session_id\n        ), 200\n        \n    except Exception\
+    \ as e:\n        logger.error(f\"Error en endpoint forward: {str(e)}\", exc_info=True)\n\
+    \        return jsonify({\"error\": str(e)}), 500\n\n\n@app.route('/api/v1/extensions/pod-forward/stop/<session_id>',\
+    \ methods=['POST'])\ndef stop_forward(session_id):\n    \"\"\"Detener un port-forward\"\
+    \"\"\n    try:\n        stop_port_forward(session_id)\n        return jsonify({\"\
+    status\": \"stopped\"}), 200\n    except Exception as e:\n        logger.error(f\"\
+    Error al detener port-forward: {str(e)}\")\n        return jsonify({\"error\"\
+    : str(e)}), 500\n\n\n@app.route('/api/v1/extensions/pod-forward/status', methods=['GET'])\n\
+    def status():\n    \"\"\"Obtener estado de todos los port-forwards activos\"\"\
+    \"\n    with forward_lock:\n        status_list = []\n        for session_id,\
+    \ info in active_forwards.items():\n            process = info['process']\n  \
+    \          status_list.append({\n                'session_id': session_id,\n \
+    \               'namespace': info['namespace'],\n                'pod': info['pod'],\n\
+    \                'pod_port': info['pod_port'],\n                'local_port':\
+    \ info['local_port'],\n                'active': process.poll() is None if process\
+    \ else False,\n                'started_at': info['started_at']\n            })\n\
+    \        return jsonify({\"active_forwards\": status_list}), 200\n\n\nif __name__\
+    \ == '__main__':\n    port = int(os.environ.get('PORT', 8080))\n    logger.info(f\"\
+    Iniciando servidor en el puerto {port}\")\n    app.run(host='0.0.0.0', port=port,\
+    \ debug=False, threaded=True)\n"
+  requirements.txt: 'Flask==2.3.3
+
+    flask-cors==4.0.0
+
+    Werkzeug==2.3.7
+
+    '
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: argocd-extension-pod-forward
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: argocd-extension-pod-forward
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: http
+    protocol: TCP
+    name: http
+  selector:
+    app.kubernetes.io/name: argocd-extension-pod-forward
