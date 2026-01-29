@@ -7,7 +7,7 @@ on:
       - master
     paths:
       - '**'
-      - '!.github/workflows/**'
+      #- '!.github/workflows/**'
   pull_request:
     branches:
       - main
@@ -19,7 +19,7 @@ on:
 env:
   REGISTRY: ghcr.io
   # Ajusta el nombre de la imagen según tu organización/repositorio
-  IMAGE_NAME: cetraro-io/poc-argocd-forward
+  IMAGE_NAME: ghcetraro/poc-argocd-forward
 
 jobs:
   build-and-push:
